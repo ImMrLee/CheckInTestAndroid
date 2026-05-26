@@ -35,6 +35,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -152,6 +153,15 @@ class CheckInRepository(private val context: Context) {
             if (province.isNotEmpty()) preferences[SAVED_PROVINCE] = province
         }
     }
+    fun isTodayCheckedIn(): Flow<Boolean> {
+        return getLastCheckInDate().map { date ->
+            date == getTodayDate()
+        }
+    }
+
+    private fun getTodayDate(): String {
+        return SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
+    }
 }
 data class AppUserInfo(
     val name: String,
@@ -176,6 +186,49 @@ class CheckInViewModel(private val repository: CheckInRepository) : ViewModel() 
 
     private var pendingLocation: AMapLocation? = null
     private var pendingOnResult: ((Boolean, String) -> Unit)? = null
+    private fun performCheckin(location: AMapLocation, onResult: (Boolean, String) -> Unit) {
+        viewModelScope.launch {
+            try {
+                val today = getTodayDate()
+                repository.saveCheckIn(today)
+                _lastCheckInDate.value = today
+                _isCheckedInToday.value = true
+
+                val userInfo = _userInfo.value
+                val userName = userInfo?.name ?: "用户"
+                val phoneNumber = userInfo?.phone ?: ""
+                val age = userInfo?.age ?: ""
+                val gender = userInfo?.gender ?: ""
+                val checkinTime = getCurrentDateTime()
+
+                val result = dbHelper.saveCheckinRecordSuspend(
+                    userName = userName,
+                    phoneNumber = phoneNumber,
+                    age = age,
+                    gender = gender,
+                    checkinTime = checkinTime,
+                    latitude = location.latitude,
+                    longitude = location.longitude,
+                    city = location.city ?: "",
+                    address = location.address ?: ""
+                )
+                syncOfflineData()
+                updateOfflineCount()
+
+                if (result.first) {
+                    onResult(true, "打卡成功！")
+                } else {
+                    saveToOffline(location)
+                    onResult(true, "打卡成功，但数据本地保存，联网后自动同步")
+                }
+
+            } catch (e: Exception) {
+                Log.e("OfflineCheck", "打卡异常: ${e.message}")
+                onResult(false, "打卡失败: ${e.message}")
+            }
+        }
+    }
+
     init {
         viewModelScope.launch {
             repository.getLastCheckInDate().collect { date ->
@@ -309,6 +362,7 @@ class CheckInViewModel(private val repository: CheckInRepository) : ViewModel() 
     private fun getTodayDate(): String {
         return SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
     }
+
     private lateinit var offlineDataManager: OfflineDataManager
     private val _offlineCount = MutableLiveData(0)
     val offlineCount: LiveData<Int> = _offlineCount
@@ -390,7 +444,7 @@ class CheckInViewModel(private val repository: CheckInRepository) : ViewModel() 
 
 
     fun checkInWithOfflineSupport(
-        context: Context,
+        context: Context,  // 添加 context 参数
         location: AMapLocation?,
         onResult: (Boolean, String) -> Unit
     ) {
@@ -403,19 +457,38 @@ class CheckInViewModel(private val repository: CheckInRepository) : ViewModel() 
         Log.d("OfflineCheck", "网络状态: $isNetAvailable")
 
         if (!isNetAvailable) {
+            pendingLocation = location
             pendingOnResult = onResult
             _showOfflineDialog.value = true
             return
         }
 
         if (location == null) {
-            onResult(false, "无法获取位置信息，请稍后重试")
+            startGPSAndCheckin(context, onResult)
             return
         }
 
         performCheckin(location, onResult)
     }
-    private fun performCheckin(location: AMapLocation, onResult: (Boolean, String) -> Unit) {
+    private val _isGPSLocating = MutableLiveData(false)
+    val isGPSLocating: LiveData<Boolean> = _isGPSLocating
+    private fun startGPSAndCheckin(
+        context: Context,
+        onResult: (Boolean, String) -> Unit
+    ) {
+        _isGPSLocating.value = true
+
+        startGPSLocationOnly(context) { gpsLocation ->
+            _isGPSLocating.value = false
+
+            if (gpsLocation != null) {
+                performCheckinWithGPS(gpsLocation, onResult)
+            } else {
+                performCheckinWithoutLocation(onResult)
+            }
+        }
+    }
+    private fun performCheckinWithoutLocation(onResult: (Boolean, String) -> Unit) {
         viewModelScope.launch {
             try {
                 val today = getTodayDate()
@@ -424,45 +497,66 @@ class CheckInViewModel(private val repository: CheckInRepository) : ViewModel() 
                 _isCheckedInToday.value = true
 
                 val userInfo = _userInfo.value
-                val userName = userInfo?.name ?: "用户"
-                val phoneNumber = userInfo?.phone ?: ""
-                val age = userInfo?.age ?: ""
-                val gender = userInfo?.gender ?: ""
                 val checkinTime = getCurrentDateTime()
 
-                val result = dbHelper.saveCheckinRecordSuspend(
-                    userName = userName,
-                    phoneNumber = phoneNumber,
-                    age = age,
-                    gender = gender,
+                val record = OfflineCheckinRecord(
+                    userName = userInfo?.name ?: "用户",
+                    phoneNumber = userInfo?.phone ?: "",
+                    age = userInfo?.age ?: "",
+                    gender = userInfo?.gender ?: "",
                     checkinTime = checkinTime,
-                    latitude = location.latitude,
-                    longitude = location.longitude,
-                    city = location.city ?: "",
-                    address = location.address ?: ""
+                    latitude = 0.0,
+                    longitude = 0.0,
+                    city = "GPS定位失败",
+                    address = "无法获取位置信息"
                 )
-                syncOfflineData()
+                offlineDataManager.saveOfflineRecord(record)
                 updateOfflineCount()
 
-                if (result.first) {
-                    onResult(true, "打卡成功！")
-                } else {
-                    saveToOffline(location)
-                    onResult(true, "打卡成功，但数据本地保存，联网后自动同步")
-                }
+                updateLocationText("GPS定位失败，打卡成功但无位置信息")
+
+                onResult(true, "打卡成功！GPS定位失败，无位置信息")
 
             } catch (e: Exception) {
-                Log.e("OfflineCheck", "打卡异常: ${e.message}")
+                Log.e("OfflineCheck", "无位置打卡失败: ${e.message}")
                 onResult(false, "打卡失败: ${e.message}")
             }
         }
     }
-    fun confirmOfflineCheckin() {
-        val location = pendingLocation
-        val onResult = pendingOnResult
+    private fun startGPSLocationOnly(
+        context: Context,
+        callback: (AMapLocation?) -> Unit
+    ) {
+        val gpsClient = AMapLocationClient(context)
+        val option = AMapLocationClientOption().apply {
+            locationMode = AMapLocationClientOption.AMapLocationMode.Device_Sensors
+            isNeedAddress = false
+            isMockEnable = false
+            interval = 2000
+            isOnceLocation = true
+        }
+        gpsClient.setLocationOption(option)
 
-        if (onResult == null) return
+        gpsClient.setLocationListener { location ->
+            gpsClient.stopLocation()
+            gpsClient.onDestroy()
+            callback(location)
+        }
 
+        gpsClient.startLocation()
+
+        viewModelScope.launch {
+            delay(30000)
+            gpsClient.stopLocation()
+            gpsClient.onDestroy()
+            callback(null)
+        }
+    }
+
+    private fun performCheckinWithGPS(
+        location: AMapLocation,
+        onResult: (Boolean, String) -> Unit
+    ) {
         viewModelScope.launch {
             try {
                 val today = getTodayDate()
@@ -470,35 +564,61 @@ class CheckInViewModel(private val repository: CheckInRepository) : ViewModel() 
                 _lastCheckInDate.value = today
                 _isCheckedInToday.value = true
 
-                if (location != null) {
-                    saveToOffline(location)
-                    onResult(true, "打卡成功！位置数据已本地保存，联网后自动同步")
-                } else {
-                    val userInfo = _userInfo.value
-                    val record = OfflineCheckinRecord(
-                        userName = userInfo?.name ?: "用户",
-                        phoneNumber = userInfo?.phone ?: "",
-                        age = userInfo?.age ?: "",
-                        gender = userInfo?.gender ?: "",
-                        checkinTime = getCurrentDateTime(),
-                        latitude = 0.0,
-                        longitude = 0.0,
-                        city = "该用户是断网打卡的，",
-                        address = "所以无法获取城市信息"
+                val userInfo = _userInfo.value
+                val checkinTime = getCurrentDateTime()
+
+                val gpsCity = "GPS定位（无法获取城市信息）"
+                val gpsAddress = "GPS定位: 纬度 ${
+                    String.format(
+                        "%.6f",
+                        location.latitude
                     )
-                    offlineDataManager.saveOfflineRecord(record)
-                    updateOfflineCount()
-                    onResult(true, "打卡成功！无位置信息，联网后自动同步")
-                }
+                }, 经度 ${String.format("%.6f", location.longitude)}"
+
+                // 保存到离线队列
+                val record = OfflineCheckinRecord(
+                    userName = userInfo?.name ?: "用户",
+                    phoneNumber = userInfo?.phone ?: "",
+                    age = userInfo?.age ?: "",
+                    gender = userInfo?.gender ?: "",
+                    checkinTime = checkinTime,
+                    latitude = location.latitude,
+                    longitude = location.longitude,
+                    city = gpsCity,
+                    address = gpsAddress
+                )
+                offlineDataManager.saveOfflineRecord(record)
+                updateOfflineCount()
+
+                updateLocationText(
+                    "GPS定位打卡成功\n纬度: ${
+                        String.format(
+                            "%.6f",
+                            location.latitude
+                        )
+                    }\n经度: ${String.format("%.6f", location.longitude)}\n城市: GPS定位"
+                )
+
+                onResult(true, "打卡成功！使用GPS定位，数据已本地保存，联网后自动同步")
+
             } catch (e: Exception) {
-                Log.e("OfflineCheck", "离线保存失败: ${e.message}")
+                Log.e("OfflineCheck", "GPS打卡失败: ${e.message}")
                 onResult(false, "打卡失败: ${e.message}")
-            } finally {
-                pendingLocation = null
-                pendingOnResult = null
-                _showOfflineDialog.value = false
             }
         }
+    }
+
+    fun confirmOfflineCheckin(context: Context) {  // 添加 context 参数
+        val location = pendingLocation
+        val onResult = pendingOnResult
+
+        if (onResult == null) return
+
+        startGPSAndCheckin(context, onResult)
+
+        pendingLocation = null
+        pendingOnResult = null
+        _showOfflineDialog.value = false
     }
     fun cancelOfflineCheckin() {
         pendingLocation = null
@@ -506,6 +626,7 @@ class CheckInViewModel(private val repository: CheckInRepository) : ViewModel() 
         _showOfflineDialog.value = false
     }
 }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun RegisterScreen(
@@ -759,8 +880,6 @@ fun RegisterScreen(
     }
 }
 
-fun Scaffold(modifier: Modifier, content: Any) {}
-
 @Composable
 fun CheckInScreen(viewModel: CheckInViewModel, onNavigateToEmergencyContacts: () -> Unit) {
     val context = LocalContext.current
@@ -771,17 +890,24 @@ fun CheckInScreen(viewModel: CheckInViewModel, onNavigateToEmergencyContacts: ()
     val userName = userInfo?.name ?: "用户"
     val offlineCount by viewModel.offlineCount.observeAsState(0)
     val showOfflineDialog by viewModel.showOfflineDialog.observeAsState(false)
+    val isGPSLocating by viewModel.isGPSLocating.observeAsState(false)
 
-    Log.e("OfflineCheck", "showOfflineDialog = $showOfflineDialog")
     if (showOfflineDialog) {
-        Log.e("OfflineCheck", "显示对话框")
         AlertDialog(
             onDismissRequest = { viewModel.cancelOfflineCheckin() },
-            title = { Text("网络不可用") },
-            text = { Text("当前未连接网络，是否继续打卡？打卡数据将本地保存，联网后自动同步。") },
+            title = { Text("断网打卡") },
+            text = {
+                Text(
+                    "当前未连接网络，将使用GPS定位进行打卡。\n\n" +
+                            "注意：\n" +
+                            "• GPS定位可能需要10-30秒，甚至更久\n" +
+                            "• 请确保在开阔地带\n" +
+                            "• 无法获取城市信息，将标记为\"GPS定位\""
+                )
+            },
             confirmButton = {
-                Button(onClick = { viewModel.confirmOfflineCheckin() }) {
-                    Text("继续打卡")
+                Button(onClick = { viewModel.confirmOfflineCheckin(context) }) {  // 传入 context
+                    Text("开始打卡")
                 }
             },
             dismissButton = {
@@ -791,24 +917,30 @@ fun CheckInScreen(viewModel: CheckInViewModel, onNavigateToEmergencyContacts: ()
             }
         )
     }
-    if (showOfflineDialog) {
+    if (isGPSLocating) {
         AlertDialog(
-            onDismissRequest = { viewModel.cancelOfflineCheckin() },
-            title = { Text("网络不可用") },
-            text = { Text("当前未连接网络，是否继续打卡？打卡数据将本地保存，联网后自动同步。") },
-            confirmButton = {
-                Button(
-                    onClick = { viewModel.confirmOfflineCheckin() },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+            onDismissRequest = {},  // 不可取消
+            title = { Text("GPS定位中") },
+            text = {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(8.dp)
                 ) {
-                    Text("继续打卡")
+                    CircularProgressIndicator()
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text(
+                        text = "正在使用GPS定位，请稍候...",
+                        fontSize = 14.sp
+                    )
+                    Text(
+                        text = "首次定位可能需要10-30秒",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             },
-            dismissButton = {
-                TextButton(onClick = { viewModel.cancelOfflineCheckin() }) {
-                    Text("取消")
-                }
-            }
+            confirmButton = {},
+            dismissButton = {}
         )
     }
     Scaffold(
@@ -1067,7 +1199,18 @@ class MainActivity : ComponentActivity() {
                 locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
             }
         }
-
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            when {
+                ContextCompat.checkSelfPermission(
+                    this, Manifest.permission.POST_NOTIFICATIONS
+                ) == PackageManager.PERMISSION_GRANTED -> {
+                    // 已有权限
+                }
+                else -> {
+                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
+        }
         setContent {
             CheckInTestTheme {
                 val navController = rememberNavController()
@@ -1115,5 +1258,12 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         viewModel.destroyLocationClient()
+    }
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (!isGranted) {
+            Toast.makeText(this, "通知权限已拒绝，将无法收到提醒", Toast.LENGTH_SHORT).show()
+        }
     }
 }

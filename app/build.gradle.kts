@@ -15,8 +15,8 @@ android {
         applicationId = "com.example.checkintest"
         minSdk = 23
         targetSdk = 36
-        versionCode = 7
-        versionName = "1.0-release4"
+        versionCode = 8
+        versionName = "1.1-release1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -92,4 +92,5 @@ dependencies {
     implementation("com.amap.api:location:6.4.5")
     testImplementation(kotlin("test"))
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("androidx.work:work-runtime-ktx:2.11.2")
 }
