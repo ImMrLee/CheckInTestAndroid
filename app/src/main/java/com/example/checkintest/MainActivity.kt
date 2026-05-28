@@ -1,6 +1,7 @@
 package com.example.checkintest
 
 import android.Manifest
+import android.app.DownloadManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -8,6 +9,7 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Log
@@ -83,6 +85,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
@@ -91,14 +94,11 @@ val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "ch
 class CheckInRepository(private val context: Context) {
     companion object {
         val LAST_CHECK_IN_DATE = stringPreferencesKey("last_check_in_date")
-
         val IS_FIRST_LAUNCH = booleanPreferencesKey("is_first_launch")
-
         val USER_NAME = stringPreferencesKey("user_name")
         val USER_PHONE = stringPreferencesKey("user_phone")
         val USER_AGE = stringPreferencesKey("user_age")
         val USER_GENDER = stringPreferencesKey("user_gender")
-
         val SAVED_CITY = stringPreferencesKey("saved_city")
         val SAVED_DISTRICT = stringPreferencesKey("saved_district")
         val SAVED_PROVINCE = stringPreferencesKey("saved_province")
@@ -153,15 +153,7 @@ class CheckInRepository(private val context: Context) {
             if (province.isNotEmpty()) preferences[SAVED_PROVINCE] = province
         }
     }
-    fun isTodayCheckedIn(): Flow<Boolean> {
-        return getLastCheckInDate().map { date ->
-            date == getTodayDate()
-        }
-    }
 
-    private fun getTodayDate(): String {
-        return SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
-    }
 }
 data class AppUserInfo(
     val name: String,
@@ -444,7 +436,7 @@ class CheckInViewModel(private val repository: CheckInRepository) : ViewModel() 
 
 
     fun checkInWithOfflineSupport(
-        context: Context,  // 添加 context 参数
+        context: Context,
         location: AMapLocation?,
         onResult: (Boolean, String) -> Unit
     ) {
@@ -608,7 +600,7 @@ class CheckInViewModel(private val repository: CheckInRepository) : ViewModel() 
         }
     }
 
-    fun confirmOfflineCheckin(context: Context) {  // 添加 context 参数
+    fun confirmOfflineCheckin(context: Context) {
         val location = pendingLocation
         val onResult = pendingOnResult
 
@@ -891,7 +883,21 @@ fun CheckInScreen(viewModel: CheckInViewModel, onNavigateToEmergencyContacts: ()
     val offlineCount by viewModel.offlineCount.observeAsState(0)
     val showOfflineDialog by viewModel.showOfflineDialog.observeAsState(false)
     val isGPSLocating by viewModel.isGPSLocating.observeAsState(false)
+    fun getGreeting(): String {
+        val calendar = Calendar.getInstance()
+        val hour = calendar.get(Calendar.HOUR_OF_DAY)
 
+        return when (hour) {
+            in 0..4 -> "夜深了"
+            in 5..8 -> "早上好"
+            in 9..11 -> "上午好"
+            in 12..13 -> "中午好"
+            in 14..17 -> "下午好"
+            in 18..20 -> "晚上好"
+            in 21..23 -> "晚安"
+            else -> "你好"
+        }
+    }
     if (showOfflineDialog) {
         AlertDialog(
             onDismissRequest = { viewModel.cancelOfflineCheckin() },
@@ -969,10 +975,11 @@ fun CheckInScreen(viewModel: CheckInViewModel, onNavigateToEmergencyContacts: ()
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
-                        text = "你好，${userName}",
-                        fontSize = 24.sp
+                        text = "${getGreeting()}，${userName}",
+                        fontSize = 20.sp,
+                        fontWeight = FontWeight.Medium
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = if (isCheckedInToday) "今日已打卡" else "请打卡",
                         fontSize = 28.sp,
@@ -1030,7 +1037,7 @@ fun CheckInScreen(viewModel: CheckInViewModel, onNavigateToEmergencyContacts: ()
                         viewModel.checkInWithOfflineSupport(
                             context = context,
                             location = null,
-                            onResult = { success, message ->
+                            onResult = { _, message ->
                                 Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                             }
                         )
@@ -1040,7 +1047,7 @@ fun CheckInScreen(viewModel: CheckInViewModel, onNavigateToEmergencyContacts: ()
                             viewModel.checkInWithOfflineSupport(
                                 context = context,
                                 location = location,
-                                onResult = { success, message ->
+                                onResult = { _, message ->
                                     Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                                 }
                             )
@@ -1097,7 +1104,7 @@ fun CheckInScreen(viewModel: CheckInViewModel, onNavigateToEmergencyContacts: ()
             Spacer(modifier = Modifier.height(16.dp))
 
             Button(
-                onClick = onNavigateToEmergencyContacts,  // 改为调用这个回调
+                onClick = onNavigateToEmergencyContacts,
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.errorContainer,
@@ -1137,6 +1144,8 @@ private fun isNetworkAvailable(context: Context): Boolean {
 class MainActivity : ComponentActivity() {
     private lateinit var viewModel: CheckInViewModel
     private var isFirstLaunch = mutableStateOf(true)
+    private lateinit var updateManager: UpdateManager
+    private var downloadReceiver: android.content.BroadcastReceiver? = null
 
     private val locationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -1148,6 +1157,14 @@ class MainActivity : ComponentActivity() {
         } else {
             viewModel.updateLocationText("定位权限被拒绝")
             Toast.makeText(this, "定位权限被拒绝", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (!isGranted) {
+            Toast.makeText(this, "通知权限已拒绝，将无法收到提醒", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -1164,7 +1181,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        registerReceiver(networkReceiver, IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION))
+        ContextCompat.registerReceiver(
+            this,
+            networkReceiver,
+            IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
     }
 
     override fun onPause() {
@@ -1199,18 +1221,25 @@ class MainActivity : ComponentActivity() {
                 locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
             }
         }
+
+        // 请求通知权限
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             when {
                 ContextCompat.checkSelfPermission(
                     this, Manifest.permission.POST_NOTIFICATIONS
-                ) == PackageManager.PERMISSION_GRANTED -> {
-                    // 已有权限
-                }
-                else -> {
+                ) != PackageManager.PERMISSION_GRANTED -> {
                     notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                 }
             }
         }
+
+        updateManager = UpdateManager(this)
+        registerDownloadReceiver()
+
+        lifecycleScope.launch {
+            checkForAppUpdate()
+        }
+
         setContent {
             CheckInTestTheme {
                 val navController = rememberNavController()
@@ -1219,7 +1248,6 @@ class MainActivity : ComponentActivity() {
                     navController = navController,
                     startDestination = if (isFirstLaunch.value) "register" else "checkin"
                 ) {
-                    // 注册页面
                     composable("register") {
                         RegisterScreen { name, phone, age, gender ->
                             lifecycleScope.launch {
@@ -1234,7 +1262,6 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    // 打卡页面
                     composable("checkin") {
                         CheckInScreen(
                             viewModel = viewModel,
@@ -1244,7 +1271,6 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
-                    // 紧急联系人页面
                     composable("emergency_contacts") {
                         EmergencyContactsScreen(
                             onBack = { navController.popBackStack() }
@@ -1255,15 +1281,68 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun registerDownloadReceiver() {
+        downloadReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (DownloadManager.ACTION_DOWNLOAD_COMPLETE == intent.action) {
+                    val downloadId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
+                    if (downloadId != -1L) {
+                        val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                        val uri = downloadManager.getUriForDownloadedFile(downloadId)
+                        uri?.let {
+                            showInstallDialog(it)
+                        }
+                    }
+                }
+            }
+        }
+
+        ContextCompat.registerReceiver(
+            this,
+            downloadReceiver,
+            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+    }
+
+    private fun showInstallDialog(uri: Uri) {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("下载完成")
+            .setMessage("新版本已下载完成，是否立即安装？")
+            .setPositiveButton("安装") { _, _ ->
+                updateManager.installApk(uri)
+            }
+            .setNegativeButton("稍后", null)
+            .show()
+    }
+
+    private fun checkForAppUpdate() {
+        lifecycleScope.launch {
+            updateManager.checkForUpdate(
+                onNewVersion = { apkUrl, changelog, versionName ->
+                    showUpdateDialog(apkUrl, changelog, versionName)
+                },
+                onError = { error ->
+                    Log.d("UpdateCheck", "检查更新失败: $error")
+                }
+            )
+        }
+    }
+    private fun showUpdateDialog(apkUrl: String, changelog: String, versionName: String) {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("发现新版本 $versionName")
+            .setMessage(changelog)
+            .setPositiveButton("立即更新") { _, _ ->
+                updateManager.downloadAndInstall(apkUrl)
+                Toast.makeText(this, "开始下载新版本，完成后将提示安装", Toast.LENGTH_LONG).show()
+            }
+            .setNegativeButton("稍后", null)
+            .show()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        downloadReceiver?.let { unregisterReceiver(it) }
         viewModel.destroyLocationClient()
-    }
-    private val notificationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        if (!isGranted) {
-            Toast.makeText(this, "通知权限已拒绝，将无法收到提醒", Toast.LENGTH_SHORT).show()
-        }
     }
 }
